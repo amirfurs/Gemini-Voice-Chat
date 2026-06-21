@@ -113,7 +113,12 @@ export async function handleInteraction(
     sessions.set(guildId, session);
 
     await interaction.editReply(
-      `✅ Joined **${voiceChannel.name}**! Speak and I'll respond with voice. Use \`/ask\` to send a text question, or \`/leave\` to disconnect.`
+      `✅ Joined **${voiceChannel.name}**! المحاور السلفي is active — speak Arabic and he'll respond with voice. Use \`/ask\` to send a text question, or \`/leave\` to disconnect.`
+    );
+
+    // Trigger self-introduction after joining
+    session.introduce().catch((err) =>
+      logger.error({ err }, "Failed to send introduction")
     );
 
   } else if (interaction.commandName === "leave") {

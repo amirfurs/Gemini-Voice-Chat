@@ -115,6 +115,10 @@ export class VoiceSession {
     });
   }
 
+  async introduce(): Promise<void> {
+    await this.gemini.introduce();
+  }
+
   async askText(text: string): Promise<void> {
     await this.gemini.sendText(text);
   }
