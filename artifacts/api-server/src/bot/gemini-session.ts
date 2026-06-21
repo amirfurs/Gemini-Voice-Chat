@@ -1,7 +1,11 @@
-import { GoogleGenAI } from "@google/genai";
 import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
+import WebSocket from "ws";
 import { logger } from "../lib/logger";
+
+const MODEL = "models/gemini-3.1-flash-live-preview";
+const API_VERSIONS = ["v1beta", "v1alpha"];
 
 function pcmToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
   const byteRate = sampleRate * channels * 2;
@@ -23,173 +27,185 @@ function pcmToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
   return Buffer.concat([header, pcm]);
 }
 
-function splitText(text: string, maxLen: number): string[] {
-  const sentences = text.match(/[^.!?]+[.!?]?/g) ?? [text];
-  const chunks: string[] = [];
-  let current = "";
-  for (const sentence of sentences) {
-    const trimmed = sentence.trim();
-    if (!trimmed) continue;
-    if ((current + " " + trimmed).trim().length <= maxLen) {
-      current = (current + " " + trimmed).trim();
-    } else {
-      if (current) chunks.push(current);
-      if (trimmed.length > maxLen) {
-        // Split by words
-        const words = trimmed.split(" ");
-        let buf = "";
-        for (const word of words) {
-          if ((buf + " " + word).trim().length <= maxLen) {
-            buf = (buf + " " + word).trim();
-          } else {
-            if (buf) chunks.push(buf);
-            buf = word;
-          }
-        }
-        if (buf) current = buf;
-        else current = "";
-      } else {
-        current = trimmed;
-      }
-    }
-  }
-  if (current) chunks.push(current);
-  return chunks.filter((c) => c.length > 0);
-}
-
-async function textToSpeechStream(text: string): Promise<Readable> {
-  const chunks = splitText(text, 190);
-  const buffers: Buffer[] = [];
-
-  for (const chunk of chunks) {
-    const url =
-      `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunk)}&tl=en&client=gtx&ttsspeed=0.9`;
-    try {
-      const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-      });
-      if (res.ok) {
-        buffers.push(Buffer.from(await res.arrayBuffer()));
-      }
-    } catch (err) {
-      logger.error({ err, chunk }, "TTS fetch failed for chunk");
-    }
-  }
-
-  const combined = Buffer.concat(buffers);
-  const readable = new Readable({ read() {} });
-  readable.push(combined);
-  readable.push(null);
-  return readable;
+function resamplePcm(pcm: Buffer): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    const ff = spawn("ffmpeg", [
+      "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+      "-f", "s16le", "-ar", "16000", "-ac", "1", "pipe:1",
+    ]);
+    ff.stdout.on("data", (c: Buffer) => chunks.push(c));
+    ff.stdout.on("end", () => resolve(Buffer.concat(chunks)));
+    ff.stderr.on("data", () => {});
+    ff.on("error", reject);
+    ff.stdin.write(pcm);
+    ff.stdin.end();
+  });
 }
 
 export class GeminiSession extends EventEmitter {
-  private ai: GoogleGenAI | null = null;
-  private history: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+  private ws: WebSocket | null = null;
+  private receivedPcm: Buffer[] = [];
+  private outputSampleRate = 24000;
+  private outputChannels = 1;
   private processing = false;
-  private systemPrompt =
-    "You are a helpful, friendly voice assistant in a Discord voice channel. " +
-    "Keep responses short and conversational — 1 to 3 sentences maximum. Speak naturally.";
 
   async connect(apiKey: string): Promise<void> {
-    this.ai = new GoogleGenAI({ apiKey });
-    // Verify the key works
-    await this.ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: [{ role: "user", parts: [{ text: "Reply with just the word: OK" }] }],
-    });
-    logger.info("Gemini API key verified ✅");
+    for (const apiVersion of API_VERSIONS) {
+      try {
+        await this.tryConnect(apiKey, apiVersion);
+        logger.info({ apiVersion, model: MODEL }, "Gemini Live connected ✅");
+        return;
+      } catch (err) {
+        logger.warn({ apiVersion, err: (err as Error).message }, "Version failed, trying next");
+      }
+    }
+    throw new Error(
+      `Could not connect to Gemini Live with model ${MODEL}. ` +
+      `Make sure your API key has access to this model in AI Studio.`
+    );
   }
 
-  async processPcm(pcm: Buffer, sampleRate: number, channels: number): Promise<void> {
-    if (!this.ai) return;
-    if (this.processing) {
-      logger.info("Already processing, skipping");
-      return;
-    }
-    if (pcm.length < 960) {
-      logger.info({ bytes: pcm.length }, "Audio too short, skipping");
-      return;
-    }
+  private tryConnect(apiKey: string, apiVersion: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const url =
+        `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.` +
+        `${apiVersion}.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+
+      const ws = new WebSocket(url);
+      let resolved = false;
+
+      const fail = (err: Error) => {
+        if (!resolved) { resolved = true; reject(err); }
+      };
+
+      ws.on("open", () => {
+        ws.send(
+          JSON.stringify({
+            setup: {
+              model: MODEL,
+              generationConfig: {
+                responseModalities: ["AUDIO"],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: "Aoede" },
+                  },
+                },
+              },
+              systemInstruction: {
+                parts: [{
+                  text:
+                    "You are a helpful, friendly voice assistant in a Discord voice channel. " +
+                    "Keep responses short and conversational — 1 to 3 sentences.",
+                }],
+              },
+            },
+          })
+        );
+      });
+
+      ws.on("message", (raw) => {
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(raw.toString()) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+
+        if (msg.setupComplete) {
+          if (!resolved) { resolved = true; this.ws = ws; resolve(); }
+          return;
+        }
+
+        const serverContent = msg.serverContent as Record<string, unknown> | undefined;
+        if (!serverContent) return;
+
+        const modelTurn = serverContent.modelTurn as Record<string, unknown> | undefined;
+        if (modelTurn) {
+          const parts = modelTurn.parts as Array<Record<string, unknown>> | undefined;
+          if (parts) {
+            for (const part of parts) {
+              const inlineData = part.inlineData as Record<string, unknown> | undefined;
+              if (inlineData) {
+                const mimeType = inlineData.mimeType as string | undefined;
+                const data = inlineData.data as string | undefined;
+                if (mimeType?.startsWith("audio/") && data) {
+                  this.receivedPcm.push(Buffer.from(data, "base64"));
+                  // Parse sample rate if provided
+                  const rateMatch = mimeType.match(/rate=(\d+)/);
+                  if (rateMatch) this.outputSampleRate = parseInt(rateMatch[1]!, 10);
+                }
+              }
+            }
+          }
+        }
+
+        if (serverContent.turnComplete) {
+          const pcm = Buffer.concat(this.receivedPcm);
+          this.receivedPcm = [];
+          if (pcm.length > 0) {
+            logger.info({ bytes: pcm.length, sampleRate: this.outputSampleRate }, "Gemini audio turn complete");
+            const wav = pcmToWav(pcm, this.outputSampleRate, this.outputChannels);
+            const stream = new Readable({ read() {} });
+            stream.push(wav);
+            stream.push(null);
+            this.emit("audioStream", stream);
+          }
+        }
+      });
+
+      ws.on("close", (code, reason) => {
+        if (!resolved) {
+          fail(new Error(`WebSocket closed: ${code} ${reason.toString()}`));
+        }
+      });
+
+      ws.on("error", (err) => fail(err as Error));
+    });
+  }
+
+  async processPcm(pcm48kStereo: Buffer): Promise<void> {
+    if (!this.ws || this.processing) return;
+    if (pcm48kStereo.length < 960 * 2 * 2) return; // too short
 
     this.processing = true;
     try {
-      const wav = pcmToWav(pcm, sampleRate, channels);
-      logger.info({ wavBytes: wav.length }, "Sending audio to Gemini");
+      const pcm16k = await resamplePcm(pcm48kStereo);
+      logger.info({ bytes: pcm16k.length }, "Sending audio to Gemini Live");
 
-      const response = await this.ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          ...this.history,
-          {
-            role: "user",
-            parts: [
-              {
-                inlineData: {
-                  mimeType: "audio/wav",
-                  data: wav.toString("base64"),
-                },
-              } as never,
-            ],
+      this.ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{
+              mimeType: "audio/pcm;rate=16000",
+              data: pcm16k.toString("base64"),
+            }],
           },
-        ],
-        config: { systemInstruction: this.systemPrompt } as never,
-      });
-
-      const text = response.text?.trim();
-      if (!text) {
-        logger.warn("Gemini returned empty response");
-        return;
-      }
-
-      logger.info({ text }, "Gemini text response");
-      this.emit("text", text);
-
-      this.history.push({ role: "user", parts: [{ text: "[voice message]" }] });
-      this.history.push({ role: "model", parts: [{ text }] });
-      if (this.history.length > 20) this.history = this.history.slice(-20);
-
-      const audioStream = await textToSpeechStream(text);
-      this.emit("audioStream", audioStream);
+        })
+      );
     } catch (err) {
-      logger.error({ err }, "Error processing audio with Gemini");
+      logger.error({ err }, "Failed to send audio");
     } finally {
       this.processing = false;
     }
   }
 
   async sendText(text: string): Promise<void> {
-    if (!this.ai) return;
-    try {
-      const response = await this.ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          ...this.history,
-          { role: "user", parts: [{ text }] },
-        ],
-        config: { systemInstruction: this.systemPrompt } as never,
-      });
-
-      const responseText = response.text?.trim();
-      if (!responseText) return;
-
-      logger.info({ responseText }, "Gemini text response (from /ask)");
-      this.emit("text", responseText);
-
-      this.history.push({ role: "user", parts: [{ text }] });
-      this.history.push({ role: "model", parts: [{ text: responseText }] });
-      if (this.history.length > 20) this.history = this.history.slice(-20);
-
-      const audioStream = await textToSpeechStream(responseText);
-      this.emit("audioStream", audioStream);
-    } catch (err) {
-      logger.error({ err }, "Error sending text to Gemini");
-    }
+    if (!this.ws) return;
+    this.ws.send(
+      JSON.stringify({
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text }] }],
+          turnComplete: true,
+        },
+      })
+    );
   }
 
   close() {
-    this.ai = null;
-    this.history = [];
+    this.ws?.close(1000);
+    this.ws = null;
+    this.receivedPcm = [];
     this.processing = false;
   }
 }
