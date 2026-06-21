@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { logger } from "../lib/logger";
 
 const GEMINI_LIVE_URL =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
 
 export class GeminiLiveSession extends EventEmitter {
   private ws: WebSocket | null = null;
@@ -68,7 +68,7 @@ export class GeminiLiveSession extends EventEmitter {
   private sendSetup() {
     const setupMsg = {
       setup: {
-        model: "models/gemini-2.0-flash-live-001",
+        model: "models/gemini-2.0-flash-exp",
         generationConfig: {
           responseModalities: ["AUDIO"],
           speechConfig: {
