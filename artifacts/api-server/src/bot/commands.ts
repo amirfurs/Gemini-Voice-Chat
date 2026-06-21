@@ -95,8 +95,8 @@ export async function handleInteraction(
     // Step 2: Connect to Gemini Live
     let gemini: GeminiLiveSession | null = null;
     try {
-      gemini = new GeminiLiveSession(apiKey);
-      await gemini.connect();
+      gemini = new GeminiLiveSession();
+      await gemini.connect(apiKey);
       logger.info("Gemini Live connected successfully");
     } catch (err) {
       logger.error({ err }, "Failed to connect to Gemini Live");

@@ -1,166 +1,127 @@
-import WebSocket from "ws";
+import { GoogleGenAI } from "@google/genai";
 import { EventEmitter } from "node:events";
 import { logger } from "../lib/logger";
 
-const GEMINI_LIVE_URL =
-  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent";
-
 export class GeminiLiveSession extends EventEmitter {
-  private ws: WebSocket | null = null;
-  private apiKey: string;
+  private session: Awaited<ReturnType<GoogleGenAI["live"]["connect"]>> | null = null;
   isSetup = false;
 
-  constructor(apiKey: string) {
-    super();
-    this.apiKey = apiKey;
-  }
+  async connect(apiKey: string): Promise<void> {
+    const ai = new GoogleGenAI({ apiKey });
 
-  connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const url = `${GEMINI_LIVE_URL}?key=${this.apiKey}`;
-      this.ws = new WebSocket(url);
-
-      let settled = false;
-
-      const doReject = (err: Error) => {
-        if (!settled) {
-          settled = true;
+      ai.live
+        .connect({
+          model: "gemini-2.0-flash-live-001",
+          config: {
+            responseModalities: ["AUDIO"] as never,
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: "Aoede" },
+              },
+            },
+            systemInstruction: {
+              parts: [
+                {
+                  text: "You are a helpful, friendly voice assistant in a Discord voice channel. Keep responses concise and conversational. Speak naturally.",
+                },
+              ],
+            },
+          },
+          callbacks: {
+            onopen: () => {
+              logger.info("Gemini Live session opened");
+              this.isSetup = true;
+              resolve();
+            },
+            onmessage: (msg: Record<string, unknown>) => {
+              this.handleMessage(msg);
+            },
+            onerror: (e: ErrorEvent) => {
+              logger.error({ err: e.message }, "Gemini Live error");
+              this.emit("error", new Error(e.message ?? "Gemini Live error"));
+              reject(new Error(e.message ?? "Gemini Live error"));
+            },
+            onclose: (e: CloseEvent) => {
+              logger.warn({ code: e.code, reason: e.reason }, "Gemini Live closed");
+              this.emit("close");
+              if (!this.isSetup) {
+                reject(
+                  new Error(
+                    `Gemini Live closed before ready (code=${e.code} reason=${e.reason ?? "none"})`
+                  )
+                );
+              }
+            },
+          },
+        })
+        .then((s) => {
+          this.session = s;
+        })
+        .catch((err: Error) => {
+          logger.error({ err }, "Failed to connect to Gemini Live");
           reject(err);
-        }
-      };
-
-      const doResolve = () => {
-        if (!settled) {
-          settled = true;
-          resolve();
-        }
-      };
-
-      this.ws.on("open", () => {
-        logger.info("Gemini Live WebSocket connected");
-        this.sendSetup();
-      });
-
-      this.ws.on("message", (data: Buffer) => {
-        try {
-          const msg = JSON.parse(data.toString());
-          this.handleMessage(msg, doResolve);
-        } catch (err) {
-          logger.error({ err }, "Failed to parse Gemini message");
-        }
-      });
-
-      this.ws.on("error", (err) => {
-        logger.error({ err }, "Gemini Live WebSocket error");
-        this.emit("error", err);
-        doReject(err as Error);
-      });
-
-      this.ws.on("close", (code: number, reason: Buffer) => {
-        const reasonStr = reason.toString();
-        logger.warn({ code, reason: reasonStr }, "Gemini Live WebSocket closed");
-        this.emit("close");
-        doReject(new Error(`Gemini WebSocket closed before setup (code=${code} reason=${reasonStr || "none"})`));
-      });
+        });
     });
   }
 
-  private sendSetup() {
-    const setupMsg = {
-      setup: {
-        model: "models/gemini-2.0-flash-exp",
-        generationConfig: {
-          responseModalities: ["AUDIO"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: "Aoede",
-              },
-            },
-          },
-        },
-        systemInstruction: {
-          parts: [
-            {
-              text: "You are a helpful, friendly voice assistant in a Discord voice channel. Keep responses concise and conversational. Speak naturally.",
-            },
-          ],
-        },
-      },
-    };
-    this.ws?.send(JSON.stringify(setupMsg));
-  }
+  private handleMessage(msg: Record<string, unknown>) {
+    try {
+      const serverContent = msg.serverContent as Record<string, unknown> | undefined;
+      if (!serverContent) return;
 
-  private handleMessage(msg: Record<string, unknown>, setupResolve: () => void) {
-    if (msg.setupComplete) {
-      logger.info("Gemini Live session setup complete");
-      this.isSetup = true;
-      setupResolve();
-      return;
-    }
+      const modelTurn = serverContent.modelTurn as Record<string, unknown> | undefined;
+      if (!modelTurn) return;
 
-    if (msg.error) {
-      logger.error({ geminiError: msg.error }, "Gemini Live API error message");
-      return;
-    }
+      const parts = modelTurn.parts as Array<Record<string, unknown>> | undefined;
+      if (!parts) return;
 
-    if (msg.serverContent) {
-      const content = msg.serverContent as Record<string, unknown>;
-
-      if (content.modelTurn) {
-        const turn = content.modelTurn as Record<string, unknown>;
-        const parts = turn.parts as Array<Record<string, unknown>> | undefined;
-        if (parts) {
-          for (const part of parts) {
-            if (part.inlineData) {
-              const inlineData = part.inlineData as Record<string, unknown>;
-              const audioData = Buffer.from(inlineData.data as string, "base64");
-              this.emit("audio", audioData);
-            }
-            if (part.text) {
-              this.emit("text", part.text as string);
-            }
-          }
+      for (const part of parts) {
+        if (part.inlineData) {
+          const inlineData = part.inlineData as Record<string, unknown>;
+          const data = Buffer.from(inlineData.data as string, "base64");
+          this.emit("audio", data);
+        }
+        if (part.text) {
+          this.emit("text", part.text as string);
         }
       }
+    } catch (err) {
+      logger.error({ err }, "Error handling Gemini message");
     }
   }
 
   sendAudio(pcmData: Buffer) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.isSetup) return;
-
-    const msg = {
-      realtimeInput: {
-        mediaChunks: [
-          {
-            mimeType: "audio/pcm;rate=48000",
-            data: pcmData.toString("base64"),
-          },
-        ],
-      },
-    };
-    this.ws.send(JSON.stringify(msg));
+    if (!this.session || !this.isSetup) return;
+    try {
+      this.session.sendRealtimeInput({
+        media: {
+          mimeType: "audio/pcm;rate=48000",
+          data: pcmData.toString("base64"),
+        } as never,
+      });
+    } catch (err) {
+      logger.error({ err }, "Failed to send audio to Gemini");
+    }
   }
 
   sendText(text: string) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.isSetup) return;
-
-    const msg = {
-      clientContent: {
-        turns: [
-          {
-            role: "user",
-            parts: [{ text }],
-          },
-        ],
+    if (!this.session || !this.isSetup) return;
+    try {
+      this.session.sendClientContent({
+        turns: [{ role: "user", parts: [{ text }] }] as never,
         turnComplete: true,
-      },
-    };
-    this.ws.send(JSON.stringify(msg));
+      });
+    } catch (err) {
+      logger.error({ err }, "Failed to send text to Gemini");
+    }
   }
 
   close() {
-    this.ws?.close();
-    this.ws = null;
+    try {
+      this.session?.close();
+    } catch (_) {}
+    this.session = null;
+    this.isSetup = false;
   }
 }
