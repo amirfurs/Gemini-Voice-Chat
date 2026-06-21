@@ -70,8 +70,10 @@ autoInstallPeers: false
 
 onlyBuiltDependencies:
   - '@swc/core'
+  - '@discordjs/opus'
   - esbuild
   - msw
+  - sodium-native
   - unrs-resolver
 
 overrides:
