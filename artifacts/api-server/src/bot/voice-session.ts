@@ -7,79 +7,63 @@ import {
   EndBehaviorType,
 } from "@discordjs/voice";
 import { Readable } from "node:stream";
-import { GeminiLiveSession } from "./gemini-live";
+import { GeminiSession } from "./gemini-session";
 import { logger } from "../lib/logger";
+
+// prism-media is CJS — load via require (available from build banner)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const prism: any = (globalThis as any).require("prism-media");
+
+const OPUS_SAMPLE_RATE = 48000;
+const OPUS_CHANNELS = 2;
 
 export class VoiceSession {
   private connection: VoiceConnection;
-  private gemini: GeminiLiveSession;
+  private gemini: GeminiSession;
   private activeUsers = new Set<string>();
-  private audioBuffer: Buffer[] = [];
-  private flushTimer: NodeJS.Timeout | null = null;
   private player = createAudioPlayer();
+  private audioQueue: Readable[] = [];
   private isPlaying = false;
-  private pendingAudio: Buffer[] = [];
 
-  constructor(connection: VoiceConnection, gemini: GeminiLiveSession) {
+  constructor(connection: VoiceConnection, gemini: GeminiSession) {
     this.connection = connection;
     this.gemini = gemini;
 
-    gemini.on("audio", (pcmData: Buffer) => {
-      this.pendingAudio.push(pcmData);
-      if (!this.isPlaying) {
-        this.flushPendingAudio();
-      }
+    gemini.on("audioStream", (stream: Readable) => {
+      this.audioQueue.push(stream);
+      if (!this.isPlaying) this.playNext();
     });
 
     gemini.on("text", (text: string) => {
-      logger.info({ text }, "Gemini text response");
+      logger.info({ text }, "Gemini response");
     });
 
     gemini.on("error", (err: Error) => {
-      logger.error({ err }, "Gemini error in voice session");
+      logger.error({ err }, "Gemini session error");
     });
 
     this.player.on(AudioPlayerStatus.Idle, () => {
       this.isPlaying = false;
-      if (this.pendingAudio.length > 0) {
-        this.flushPendingAudio();
-      }
+      this.playNext();
     });
 
     this.player.on("error", (err) => {
       logger.error({ err }, "Audio player error");
       this.isPlaying = false;
+      this.playNext();
     });
 
     this.connection.subscribe(this.player);
     this.startListening();
   }
 
-  private flushPendingAudio() {
-    if (this.pendingAudio.length === 0) return;
-    const combined = Buffer.concat(this.pendingAudio);
-    this.pendingAudio = [];
-    this.playPcm(combined);
-  }
-
-  private playPcm(pcm: Buffer) {
-    if (pcm.length === 0) return;
+  private playNext() {
+    const stream = this.audioQueue.shift();
+    if (!stream) return;
     this.isPlaying = true;
-
-    const readable = new Readable({
-      read() {},
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
     });
-
-    const chunkSize = 4096;
-    for (let i = 0; i < pcm.length; i += chunkSize) {
-      readable.push(pcm.slice(i, i + chunkSize));
-    }
-    readable.push(null);
-
-    const resource = createAudioResource(readable, {
-      inputType: StreamType.Raw,
-    });
-
     this.player.play(resource);
   }
 
@@ -89,51 +73,54 @@ export class VoiceSession {
     receiver.speaking.on("start", (userId: string) => {
       if (this.activeUsers.has(userId)) return;
       this.activeUsers.add(userId);
+      logger.info({ userId }, "User started speaking");
 
-      logger.info({ userId }, "User started speaking, subscribing to audio");
-
-      const stream = receiver.subscribe(userId, {
-        end: {
-          behavior: EndBehaviorType.AfterSilence,
-          duration: 500,
-        },
+      const opusStream = receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
       });
 
-      stream.on("data", (chunk: Buffer) => {
-        this.audioBuffer.push(chunk);
-        if (this.flushTimer) clearTimeout(this.flushTimer);
-        this.flushTimer = setTimeout(() => {
-          this.flushAudioToGemini();
-        }, 250);
+      // Decode Opus → s16le PCM via prism-media
+      const decoder = new prism.opus.Decoder({
+        rate: OPUS_SAMPLE_RATE,
+        channels: OPUS_CHANNELS,
+        frameSize: 960,
       });
 
-      stream.on("end", () => {
+      const pcmChunks: Buffer[] = [];
+
+      opusStream.pipe(decoder);
+
+      decoder.on("data", (chunk: Buffer) => {
+        pcmChunks.push(chunk);
+      });
+
+      decoder.on("end", async () => {
         this.activeUsers.delete(userId);
-        logger.info({ userId }, "User stopped speaking");
-        if (this.audioBuffer.length > 0) {
-          if (this.flushTimer) clearTimeout(this.flushTimer);
-          this.flushAudioToGemini();
-        }
+        logger.info({ userId, chunks: pcmChunks.length }, "User stopped speaking");
+
+        if (pcmChunks.length === 0) return;
+        const pcm = Buffer.concat(pcmChunks);
+        await this.gemini.processPcm(pcm, OPUS_SAMPLE_RATE, OPUS_CHANNELS);
       });
 
-      stream.on("error", (err) => {
-        logger.error({ err, userId }, "Audio receive stream error");
+      decoder.on("error", (err: Error) => {
+        logger.error({ err, userId }, "Decoder error");
+        this.activeUsers.delete(userId);
+      });
+
+      opusStream.on("error", (err: Error) => {
+        logger.error({ err, userId }, "Opus stream error");
         this.activeUsers.delete(userId);
       });
     });
   }
 
-  private flushAudioToGemini() {
-    if (this.audioBuffer.length === 0) return;
-    const combined = Buffer.concat(this.audioBuffer);
-    this.audioBuffer = [];
-    logger.info({ bytes: combined.length }, "Sending audio to Gemini");
-    this.gemini.sendAudio(combined);
+  async askText(text: string): Promise<void> {
+    await this.gemini.sendText(text);
   }
 
   destroy() {
-    if (this.flushTimer) clearTimeout(this.flushTimer);
-    this.activeUsers.clear();
+    this.audioQueue = [];
     this.player.stop();
     this.gemini.close();
     this.connection.destroy();
