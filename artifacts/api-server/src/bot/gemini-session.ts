@@ -115,7 +115,7 @@ export class GeminiSession extends EventEmitter {
                 responseModalities: ["AUDIO"],
                 speechConfig: {
                   voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: "Aoede" },
+                    prebuiltVoiceConfig: { voiceName: "Charon" },
                   },
                 },
               },
