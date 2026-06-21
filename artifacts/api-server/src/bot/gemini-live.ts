@@ -2,19 +2,13 @@ import WebSocket from "ws";
 import { EventEmitter } from "node:events";
 import { logger } from "../lib/logger";
 
-const GEMINI_LIVE_URL = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
-
-export interface GeminiLiveEvents {
-  audio: (pcmData: Buffer) => void;
-  text: (text: string) => void;
-  error: (err: Error) => void;
-  close: () => void;
-}
+const GEMINI_LIVE_URL =
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 export class GeminiLiveSession extends EventEmitter {
   private ws: WebSocket | null = null;
   private apiKey: string;
-  private isSetup = false;
+  isSetup = false;
 
   constructor(apiKey: string) {
     super();
@@ -26,6 +20,22 @@ export class GeminiLiveSession extends EventEmitter {
       const url = `${GEMINI_LIVE_URL}?key=${this.apiKey}`;
       this.ws = new WebSocket(url);
 
+      let settled = false;
+
+      const doReject = (err: Error) => {
+        if (!settled) {
+          settled = true;
+          reject(err);
+        }
+      };
+
+      const doResolve = () => {
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+
       this.ws.on("open", () => {
         logger.info("Gemini Live WebSocket connected");
         this.sendSetup();
@@ -34,7 +44,7 @@ export class GeminiLiveSession extends EventEmitter {
       this.ws.on("message", (data: Buffer) => {
         try {
           const msg = JSON.parse(data.toString());
-          this.handleMessage(msg, resolve);
+          this.handleMessage(msg, doResolve);
         } catch (err) {
           logger.error({ err }, "Failed to parse Gemini message");
         }
@@ -43,12 +53,14 @@ export class GeminiLiveSession extends EventEmitter {
       this.ws.on("error", (err) => {
         logger.error({ err }, "Gemini Live WebSocket error");
         this.emit("error", err);
-        reject(err);
+        doReject(err as Error);
       });
 
-      this.ws.on("close", () => {
-        logger.info("Gemini Live WebSocket closed");
+      this.ws.on("close", (code: number, reason: Buffer) => {
+        const reasonStr = reason.toString();
+        logger.warn({ code, reason: reasonStr }, "Gemini Live WebSocket closed");
         this.emit("close");
+        doReject(new Error(`Gemini WebSocket closed before setup (code=${code} reason=${reasonStr || "none"})`));
       });
     });
   }
@@ -79,11 +91,16 @@ export class GeminiLiveSession extends EventEmitter {
     this.ws?.send(JSON.stringify(setupMsg));
   }
 
-  private handleMessage(msg: Record<string, unknown>, setupResolve?: (v: void) => void) {
-    if (msg.setupComplete && setupResolve) {
+  private handleMessage(msg: Record<string, unknown>, setupResolve: () => void) {
+    if (msg.setupComplete) {
       logger.info("Gemini Live session setup complete");
       this.isSetup = true;
       setupResolve();
+      return;
+    }
+
+    if (msg.error) {
+      logger.error({ geminiError: msg.error }, "Gemini Live API error message");
       return;
     }
 
@@ -97,10 +114,8 @@ export class GeminiLiveSession extends EventEmitter {
           for (const part of parts) {
             if (part.inlineData) {
               const inlineData = part.inlineData as Record<string, unknown>;
-              if (inlineData.mimeType === "audio/pcm;rate=24000") {
-                const audioData = Buffer.from(inlineData.data as string, "base64");
-                this.emit("audio", audioData);
-              }
+              const audioData = Buffer.from(inlineData.data as string, "base64");
+              this.emit("audio", audioData);
             }
             if (part.text) {
               this.emit("text", part.text as string);

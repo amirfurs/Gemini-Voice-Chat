@@ -1,15 +1,11 @@
 import {
   VoiceConnection,
-  AudioReceiveStream,
-  getVoiceConnection,
   createAudioResource,
   createAudioPlayer,
   AudioPlayerStatus,
   StreamType,
-  VoiceConnectionStatus,
-  entersState,
+  EndBehaviorType,
 } from "@discordjs/voice";
-import { VoiceChannel, GuildMember } from "discord.js";
 import { Readable } from "node:stream";
 import { GeminiLiveSession } from "./gemini-live";
 import { logger } from "../lib/logger";
@@ -17,7 +13,7 @@ import { logger } from "../lib/logger";
 export class VoiceSession {
   private connection: VoiceConnection;
   private gemini: GeminiLiveSession;
-  private activeStreams = new Map<string, AudioReceiveStream>();
+  private activeUsers = new Set<string>();
   private audioBuffer: Buffer[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
   private player = createAudioPlayer();
@@ -50,6 +46,11 @@ export class VoiceSession {
       }
     });
 
+    this.player.on("error", (err) => {
+      logger.error({ err }, "Audio player error");
+      this.isPlaying = false;
+    });
+
     this.connection.subscribe(this.player);
     this.startListening();
   }
@@ -62,16 +63,18 @@ export class VoiceSession {
   }
 
   private playPcm(pcm: Buffer) {
+    if (pcm.length === 0) return;
     this.isPlaying = true;
-    // Gemini returns 24kHz mono s16le PCM — wrap it in a readable stream
-    const readable = Readable.from(
-      (function* () {
-        const chunkSize = 4096;
-        for (let i = 0; i < pcm.length; i += chunkSize) {
-          yield pcm.slice(i, i + chunkSize);
-        }
-      })()
-    );
+
+    const readable = new Readable({
+      read() {},
+    });
+
+    const chunkSize = 4096;
+    for (let i = 0; i < pcm.length; i += chunkSize) {
+      readable.push(pcm.slice(i, i + chunkSize));
+    }
+    readable.push(null);
 
     const resource = createAudioResource(readable, {
       inputType: StreamType.Raw,
@@ -84,29 +87,38 @@ export class VoiceSession {
     const receiver = this.connection.receiver;
 
     receiver.speaking.on("start", (userId: string) => {
-      if (this.activeStreams.has(userId)) return;
+      if (this.activeUsers.has(userId)) return;
+      this.activeUsers.add(userId);
 
-      logger.info({ userId }, "User started speaking");
+      logger.info({ userId }, "User started speaking, subscribing to audio");
 
       const stream = receiver.subscribe(userId, {
-        end: { behavior: 2 as const, duration: 500 },
+        end: {
+          behavior: EndBehaviorType.AfterSilence,
+          duration: 500,
+        },
       });
-
-      this.activeStreams.set(userId, stream);
 
       stream.on("data", (chunk: Buffer) => {
         this.audioBuffer.push(chunk);
         if (this.flushTimer) clearTimeout(this.flushTimer);
         this.flushTimer = setTimeout(() => {
           this.flushAudioToGemini();
-        }, 300);
+        }, 250);
       });
 
       stream.on("end", () => {
-        this.activeStreams.delete(userId);
+        this.activeUsers.delete(userId);
+        logger.info({ userId }, "User stopped speaking");
         if (this.audioBuffer.length > 0) {
+          if (this.flushTimer) clearTimeout(this.flushTimer);
           this.flushAudioToGemini();
         }
+      });
+
+      stream.on("error", (err) => {
+        logger.error({ err, userId }, "Audio receive stream error");
+        this.activeUsers.delete(userId);
       });
     });
   }
@@ -115,12 +127,13 @@ export class VoiceSession {
     if (this.audioBuffer.length === 0) return;
     const combined = Buffer.concat(this.audioBuffer);
     this.audioBuffer = [];
+    logger.info({ bytes: combined.length }, "Sending audio to Gemini");
     this.gemini.sendAudio(combined);
   }
 
   destroy() {
     if (this.flushTimer) clearTimeout(this.flushTimer);
-    this.activeStreams.clear();
+    this.activeUsers.clear();
     this.player.stop();
     this.gemini.close();
     this.connection.destroy();
