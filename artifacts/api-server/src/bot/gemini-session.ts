@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import WebSocket from "ws";
 import { logger } from "../lib/logger";
+import { TOOL_DECLARATIONS, executeTool } from "./turath-search";
 
 const MODEL = "models/gemini-3.1-flash-live-preview";
 const API_VERSIONS = ["v1beta", "v1alpha"];
@@ -20,18 +21,28 @@ const SYSTEM_PROMPT = `
 4. الاعتماد على التراث: يجب أن تكون ردودك مدعمة بالنقولات الدقيقة من كتب التراث (مثل: درء تعارض العقل والنقل، الجواب الصحيح لمن بدل دين المسيح، منهاج السنة النبوية، وغيرها).
 5. اللغة والأسلوب: لغتك فصحى، رصينة، قوية، واثقة، وأكاديمية. لا تستخدم أسلوباً هجومياً بذيئاً، بل حزماً علمياً يفحم الخصم بالحجة والبرهان، مع إظهار العزة بدين الإسلام.
 
+# استخدام أدوات البحث في كتب التراث
+عندما تحتاج إلى نص أو اقتباس من كتاب تراثي:
+1. استخدم أداة search_books للبحث عن الكتاب والحصول على معرّفه.
+2. استخدم search_book_index للبحث في فهرس الكتاب عن الموضوع.
+3. استخدم search_text_in_book لاستخراج النص الحرفي من الكتاب.
+4. إذا لم تعرف الكتاب المحدد، استخدم search_all_texts للبحث في جميع الكتب.
+لا تختلق اقتباسات، بل اعتمد دائماً على النصوص التي تعيدها الأدوات.
+
 # خطوات تنفيذ الرد عند طرح شبهة
 1. تحليل الشبهة: فكك دعوى الخصم إلى مقدمات ونتيجة.
 2. تحرير محل النزاع: وضح المسألة بدقة.
-3. اعرض الرد النقلي: الآيات، الأحاديث، أو كلام العلماء مع العزو.
-4. اعرض الرد العقلي: بيّن الفساد المنطقي في طعن الخصم.
-5. اختم بالإلزام: اقلب حجة الخصم عليه.
+3. ابحث في كتب التراث (باستخدام الأدوات) لاستخراج الردود.
+4. اعرض الرد النقلي: الآيات، الأحاديث، أو كلام العلماء مع العزو.
+5. اعرض الرد العقلي: بيّن الفساد المنطقي في طعن الخصم.
+6. اختم بالإلزام: اقلب حجة الخصم عليه.
 
 # تعليمات خاصة بالصوت
 - عند الانضمام إلى القناة الصوتية، قدّم نفسك باختصار بالعربية الفصحى.
 - تحدث بصوت واثق وعلمي يليق بمقام الباحث الشرعي.
 - اجعل إجاباتك الصوتية موجزة ومركزة (جملتان إلى أربع جمل) ثم اسأل إن كان المستمع يريد التفصيل.
 - إذا طُرحت شبهة، لا تتعجل بل ابدأ بقول: "الجواب عن هذه الشبهة من وجوه..." ثم اذكر الوجه الأول فقط، وانتظر ردة فعل المستمع.
+- عند البحث في الكتب، أخبر المستمع بذلك قائلاً: "أبحث الآن في كتب التراث..." قبل أن تبدأ الأدوات.
 `.trim();
 
 function pcmToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
@@ -122,6 +133,7 @@ export class GeminiSession extends EventEmitter {
               systemInstruction: {
                 parts: [{ text: SYSTEM_PROMPT }],
               },
+              tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
             },
           })
         );
@@ -140,6 +152,12 @@ export class GeminiSession extends EventEmitter {
           return;
         }
 
+        // ── Tool call from Gemini ──────────────────────────────────────
+        if (msg.toolCall) {
+          this.handleToolCall(msg.toolCall as Record<string, unknown>);
+          return;
+        }
+
         const serverContent = msg.serverContent as Record<string, unknown> | undefined;
         if (!serverContent) return;
 
@@ -154,7 +172,6 @@ export class GeminiSession extends EventEmitter {
                 const data = inlineData.data as string | undefined;
                 if (mimeType?.startsWith("audio/") && data) {
                   this.receivedPcm.push(Buffer.from(data, "base64"));
-                  // Parse sample rate if provided
                   const rateMatch = mimeType.match(/rate=(\d+)/);
                   if (rateMatch) this.outputSampleRate = parseInt(rateMatch[1]!, 10);
                 }
@@ -187,9 +204,38 @@ export class GeminiSession extends EventEmitter {
     });
   }
 
+  // ── Tool call handler: executes the search and sends result back ─────
+  private handleToolCall(toolCall: Record<string, unknown>) {
+    const functionCalls = toolCall.functionCalls as Array<{
+      id: string;
+      name: string;
+      args: Record<string, unknown>;
+    }> | undefined;
+
+    if (!functionCalls?.length) return;
+
+    logger.info({ tools: functionCalls.map((f) => f.name) }, "Gemini requested tools");
+
+    // Execute all requested functions in parallel, then send responses
+    Promise.all(
+      functionCalls.map(async ({ id, name, args }) => {
+        const result = await executeTool(name, args);
+        return { id, response: { output: result } };
+      })
+    ).then((responses) => {
+      if (!this.ws) return;
+      logger.info({ count: responses.length }, "Sending tool responses to Gemini");
+      this.ws.send(
+        JSON.stringify({ toolResponse: { functionResponses: responses } })
+      );
+    }).catch((err) => {
+      logger.error({ err }, "Tool execution batch failed");
+    });
+  }
+
   async processPcm(pcm48kStereo: Buffer): Promise<void> {
     if (!this.ws || this.processing) return;
-    if (pcm48kStereo.length < 960 * 2 * 2) return; // too short
+    if (pcm48kStereo.length < 960 * 2 * 2) return;
 
     this.processing = true;
     try {
