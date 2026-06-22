@@ -35,6 +35,7 @@ async function buildAll() {
       "@snazzah/davey-linux-x64-gnu",
       "sodium-native",
       "prism-media",
+      "opusscript",
       "discord.js",
       "@discordjs/voice",
       "ws",

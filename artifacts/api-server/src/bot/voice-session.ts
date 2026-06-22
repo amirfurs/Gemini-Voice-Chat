@@ -10,9 +10,9 @@ import { Readable } from "node:stream";
 import { GeminiSession } from "./gemini-session";
 import { logger } from "../lib/logger";
 
-// prism-media is CJS — load via require (available from build banner)
+// opusscript is pure WASM — works on any Node.js version
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const prism: any = (globalThis as any).require("prism-media");
+const OpusScript: any = (globalThis as any).require("opusscript");
 
 const OPUS_SAMPLE_RATE = 48000;
 const OPUS_CHANNELS = 2;
@@ -108,29 +108,26 @@ export class VoiceSession {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
       });
 
-      const decoder = new prism.opus.Decoder({
-        rate: OPUS_SAMPLE_RATE,
-        channels: OPUS_CHANNELS,
-        frameSize: 960,
-      });
-
+      // Use opusscript (pure WASM) to decode each raw Opus frame → s16le PCM
+      const decoder = new OpusScript(OPUS_SAMPLE_RATE, OPUS_CHANNELS);
       const pcmChunks: Buffer[] = [];
-      opusStream.pipe(decoder);
 
-      decoder.on("data", (chunk: Buffer) => {
-        pcmChunks.push(chunk);
+      opusStream.on("data", (frame: Buffer) => {
+        try {
+          const pcm: Buffer = decoder.decode(frame);
+          if (pcm?.length) pcmChunks.push(Buffer.from(pcm));
+        } catch {
+          // skip corrupted frames
+        }
       });
 
-      decoder.on("end", async () => {
+      opusStream.on("end", async () => {
         this.activeUsers.delete(userId);
+        try { decoder.delete?.(); } catch { /* ignore */ }
         if (pcmChunks.length === 0) return;
         const pcm = Buffer.concat(pcmChunks);
+        logger.info({ userId, bytes: pcm.length }, "Decoded PCM from voice");
         await this.gemini.processPcm(pcm, OPUS_SAMPLE_RATE, OPUS_CHANNELS);
-      });
-
-      decoder.on("error", (err: Error) => {
-        logger.error({ err, userId }, "Decoder error");
-        this.activeUsers.delete(userId);
       });
 
       opusStream.on("error", (err: Error) => {
