@@ -147,6 +147,33 @@ export class GeminiSession extends EventEmitter {
           return;
         }
 
+        // Log every top-level key so we can see what Gemini sends back
+        const topKeys = Object.keys(msg);
+        logger.info({ topKeys }, "← Gemini WS message");
+        if (msg.error) logger.error({ error: msg.error }, "Gemini error message");
+        if (msg.serverContent) {
+          const sc = msg.serverContent as Record<string, unknown>;
+          logger.info({
+            hasModelTurn: !!sc["modelTurn"],
+            turnComplete: !!sc["turnComplete"],
+            interrupted: !!sc["interrupted"],
+          }, "serverContent detail");
+          const mt = sc["modelTurn"] as Record<string, unknown> | undefined;
+          if (mt) {
+            const parts = (mt["parts"] as Array<Record<string, unknown>> | undefined) ?? [];
+            parts.forEach((p, i) => {
+              const id = p["inlineData"] as Record<string, unknown> | undefined;
+              logger.info({
+                partIndex: i,
+                hasText: !!p["text"],
+                hasFunctionCall: !!p["functionCall"],
+                hasInlineData: !!id,
+                inlineDataMime: id?.["mimeType"],
+              }, "model turn part");
+            });
+          }
+        }
+
         if (msg.setupComplete) {
           if (!resolved) { resolved = true; this.ws = ws; resolve(); }
           return;
@@ -242,13 +269,23 @@ export class GeminiSession extends EventEmitter {
       const pcm16k = await resamplePcm(pcm48kStereo);
       logger.info({ bytes: pcm16k.length }, "Sending audio to Gemini Live");
 
+      // Use clientContent + turnComplete so Gemini treats this as a
+      // complete user turn and always generates a response.
+      // (realtimeInput requires continuous VAD which we don't stream.)
+      const wav = pcmToWav(pcm16k, 16000, 1);
       this.ws.send(
         JSON.stringify({
-          realtimeInput: {
-            mediaChunks: [{
-              mimeType: "audio/pcm;rate=16000",
-              data: pcm16k.toString("base64"),
+          clientContent: {
+            turns: [{
+              role: "user",
+              parts: [{
+                inlineData: {
+                  mimeType: "audio/wav",
+                  data: wav.toString("base64"),
+                },
+              }],
             }],
+            turnComplete: true,
           },
         })
       );
