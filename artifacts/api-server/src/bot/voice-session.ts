@@ -20,22 +20,22 @@ const OPUS_CHANNELS = 2;
 export class VoiceSession {
   private connection: VoiceConnection;
   private gemini: GeminiSession;
+  private ownerId: string;
+  private permittedUsers: Set<string>;
   private activeUsers = new Set<string>();
   private player = createAudioPlayer();
   private audioQueue: Readable[] = [];
   private isPlaying = false;
 
-  constructor(connection: VoiceConnection, gemini: GeminiSession) {
+  constructor(connection: VoiceConnection, gemini: GeminiSession, ownerId: string) {
     this.connection = connection;
     this.gemini = gemini;
+    this.ownerId = ownerId;
+    this.permittedUsers = new Set([ownerId]); // owner always has access
 
     gemini.on("audioStream", (stream: Readable) => {
       this.audioQueue.push(stream);
       if (!this.isPlaying) this.playNext();
-    });
-
-    gemini.on("text", (text: string) => {
-      logger.info({ text }, "Gemini response");
     });
 
     gemini.on("error", (err: Error) => {
@@ -57,6 +57,29 @@ export class VoiceSession {
     this.startListening();
   }
 
+  get owner(): string {
+    return this.ownerId;
+  }
+
+  permitUser(userId: string): void {
+    this.permittedUsers.add(userId);
+    logger.info({ userId }, "User permitted to talk to bot");
+  }
+
+  revokeUser(userId: string): void {
+    if (userId === this.ownerId) return; // can't revoke owner
+    this.permittedUsers.delete(userId);
+    logger.info({ userId }, "User permission revoked");
+  }
+
+  isPermitted(userId: string): boolean {
+    return this.permittedUsers.has(userId);
+  }
+
+  getPermittedList(): string[] {
+    return [...this.permittedUsers];
+  }
+
   private playNext() {
     const stream = this.audioQueue.shift();
     if (!stream) return;
@@ -71,15 +94,20 @@ export class VoiceSession {
     const receiver = this.connection.receiver;
 
     receiver.speaking.on("start", (userId: string) => {
+      // Only process audio from permitted users
+      if (!this.permittedUsers.has(userId)) {
+        logger.info({ userId }, "Ignored audio — user not permitted");
+        return;
+      }
+
       if (this.activeUsers.has(userId)) return;
       this.activeUsers.add(userId);
-      logger.info({ userId }, "User started speaking");
+      logger.info({ userId }, "Permitted user started speaking");
 
       const opusStream = receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 800 },
       });
 
-      // Decode Opus → s16le PCM via prism-media
       const decoder = new prism.opus.Decoder({
         rate: OPUS_SAMPLE_RATE,
         channels: OPUS_CHANNELS,
@@ -87,7 +115,6 @@ export class VoiceSession {
       });
 
       const pcmChunks: Buffer[] = [];
-
       opusStream.pipe(decoder);
 
       decoder.on("data", (chunk: Buffer) => {
@@ -96,8 +123,6 @@ export class VoiceSession {
 
       decoder.on("end", async () => {
         this.activeUsers.delete(userId);
-        logger.info({ userId, chunks: pcmChunks.length }, "User stopped speaking");
-
         if (pcmChunks.length === 0) return;
         const pcm = Buffer.concat(pcmChunks);
         await this.gemini.processPcm(pcm, OPUS_SAMPLE_RATE, OPUS_CHANNELS);
@@ -121,6 +146,15 @@ export class VoiceSession {
 
   async askText(text: string): Promise<void> {
     await this.gemini.sendText(text);
+  }
+
+  async readMessages(messages: Array<{ author: string; content: string }>): Promise<void> {
+    const formatted = messages
+      .map((m) => `${m.author}: ${m.content}`)
+      .join("\n");
+    const prompt =
+      `المالك طلب منك قراءة الرسائل التالية من قناة النص والتعليق عليها إذا وجدت فيها ما يستحق الرد:\n\n${formatted}`;
+    await this.gemini.sendText(prompt);
   }
 
   destroy() {
